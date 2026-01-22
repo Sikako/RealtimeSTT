@@ -21,6 +21,9 @@ if __name__ == '__main__':
     parser.add_argument('-d', '--root', type=str, # no default=None,
                 help='Root directory where the Whisper models are downloaded to.')
 
+    parser.add_argument('-dev', '--device', type=str, default='cpu',
+                help='Device to use for computation. Options: cpu, cuda. Default is cpu.')
+
     from install_packages import check_and_install_packages
     check_and_install_packages([
         {
@@ -45,7 +48,20 @@ if __name__ == '__main__':
     console.print("System initializing, please wait")
 
     import os
+    
+    # Fix for "mkl_malloc: failed to allocate memory" error on CPU
+    # This limits the number of threads used by the MKL library, reducing memory pressure.
+    os.environ['MKL_NUM_THREADS'] = '1'
+
     import sys
+
+    args = parser.parse_args()
+    if args.root:
+        # Set TORCH_HOME to download the Silero VAD model into our specified models directory
+        torch_home = os.path.abspath(args.root)
+        os.environ['TORCH_HOME'] = torch_home
+        print(f"Environment variable TORCH_HOME set to: {torch_home}")
+
     from RealtimeSTT import AudioToTextRecorder
     from colorama import Fore, Style
     import colorama
@@ -182,21 +198,19 @@ if __name__ == '__main__':
         ),
         'silero_use_onnx': True,
         'faster_whisper_vad_filter': False,
+        'device': 'cpu',
     }
 
-    args = parser.parse_args()
-    if args.model is not None:
-        recorder_config['model'] = args.model
-        print(f"Argument 'model' set to {recorder_config['model']}")
-    if args.rt_model is not None:
-        recorder_config['realtime_model_type'] = args.rt_model
-        print(f"Argument 'realtime_model_type' set to {recorder_config['realtime_model_type']}")
-    if args.lang is not None:
-        recorder_config['language'] = args.lang
-        print(f"Argument 'language' set to {recorder_config['language']}")
-    if args.root is not None:
-        recorder_config['download_root'] = args.root
-        print(f"Argument 'download_root' set to {recorder_config['download_root']}")
+    # args are parsed before this block
+
+    # Automatically locate or facilitate download of the VAD model
+    if 'TORCH_HOME' in os.environ:
+        expected_vad_path = os.path.join(os.environ['TORCH_HOME'], 'hub', 'snakers4_silero-vad_master', 'silero_vad.onnx')
+        if os.path.exists(expected_vad_path):
+            recorder_config['silero_model_path'] = expected_vad_path
+            print(f"Found local Silero VAD model at: {expected_vad_path}")
+        else:
+            print(f"Local Silero VAD model not found. If online, it will be downloaded to: {expected_vad_path}")
 
     if EXTENDED_LOGGING:
         recorder_config['level'] = logging.DEBUG

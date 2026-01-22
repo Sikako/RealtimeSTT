@@ -11,3 +11,5 @@ wheels/
 *.exe
 *.log
 models/
+fastapi/
+fastapi.7z
