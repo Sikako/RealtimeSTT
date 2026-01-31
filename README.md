@@ -570,6 +570,18 @@ python general_stt_client.py --mode file --path test.wav
 - [效能調校指南](./wiki/Performance-Tuning.md)
 - [API 參考手冊](./wiki/API-Reference.md)
 
+### Wiki 遷移說明
+
+> **注意**: 目前技術文檔位於倉庫的 `wiki/` 目錄中。如果您希望將這些內容遷移到 GitHub Wiki 頁面，請參考 [Wiki 遷移指南](./WIKI_MIGRATION_GUIDE.md)。
+> 
+> 快速遷移步驟：
+> ```bash
+> # 執行自動化遷移腳本
+> ./migrate_wiki.sh
+> ```
+> 
+> 遷移後可訪問：https://github.com/Sikako/RealtimeSTT/wiki
+
 ---
 
 ## 授權與貢獻
