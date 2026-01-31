@@ -16,12 +16,10 @@
 ### 進階主題
 - [離線模型配置](./Offline-Model-Configuration.md) - 離線環境的模型配置與 Monkey Patching
 - [效能調校指南](./Performance-Tuning.md) - 系統效能優化策略
-- [並發處理機制](./Concurrency-Model.md) - Threading vs Multiprocessing
 
 ### 參考資料
 - [API 參考手冊](./API-Reference.md) - 完整的 API 文檔
-- [配置參數說明](./Configuration.md) - 所有可調整參數的詳細說明
-- [部署指南](./Deployment.md) - 生產環境部署最佳實踐
+- [效能調校指南](./Performance-Tuning.md) - 系統效能優化策略
 
 ## 快速導航
 
