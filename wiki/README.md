@@ -6,7 +6,6 @@
 
 ### 基礎架構
 - [系統架構設計](./Architecture.md) - 整體系統設計與模組劃分
-- [資料流程圖](./Data-Flow.md) - 音訊資料的完整處理流程
 
 ### 核心機制
 - [VAD 機制詳解](./VAD-Mechanism.md) - Silero VAD 的運作原理與優化
