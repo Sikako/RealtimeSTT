@@ -161,9 +161,9 @@ class VADProcessor(AudioToTextRecorder):
                     min_length_of_recording=0.5,
                     post_speech_silence_duration=0.6,
                     # Callbacks for debugging
-                    on_vad_detect_start=lambda: logger.info(f"[{self.session_id}] VAD: Listening..."),
-                    on_vad_start=lambda: logger.info(f"[{self.session_id}] VAD: Speech Detected (Start)"),
-                    on_vad_stop=lambda: logger.info(f"[{self.session_id}] VAD: Speech Ended (Stop)"),
+                    on_vad_detect_start=lambda: logger.info(f"[{self.session_id}][{self.channel_id}] VAD: Listening..."),
+                    on_vad_start=lambda: logger.info(f"[{self.session_id}][{self.channel_id}] VAD: Speech Detected (Start)"),
+                    on_vad_stop=lambda: logger.info(f"[{self.session_id}][{self.channel_id}] VAD: Speech Ended (Stop)"),
                     on_recording_start=self._handle_recording_start,
                     on_recording_stop=self._handle_recording_stop, # Hook to trigger transcription
                     # 避免在 Server 端列印過多 log (但為了 Debug 先註解掉或設為 False)
@@ -179,9 +179,16 @@ class VADProcessor(AudioToTextRecorder):
             # 確保狀態正確
             self.is_recording = False 
 
+            # Fix: 清除 RealtimeSTT 可能重複添加的 Logger Handlers
+            # 避免每個連線都多一組 Console Output
+            # Library 內部 logger 名稱為 "realtimestt" (見 audio_recorder.py line 62)
+            lib_logger = logging.getLogger("realtimestt")
+            lib_logger.handlers = []
+            lib_logger.propagate = True # 讓 Log 向上傳遞給 Server Root Logger 統一列印 
+
     def _handle_recording_start(self):
         """開始錄音時，啟用靜音自動停止"""
-        logger.info(f"[{self.session_id}] Recording Started")
+        logger.info(f"[{self.session_id}][{self.channel_id}] Recording Started")
         self.stop_recording_on_voice_deactivity = True
 
     def _handle_recording_stop(self):
@@ -189,7 +196,7 @@ class VADProcessor(AudioToTextRecorder):
         當 VAD 偵測到說話結束並停止錄音時，觸發此回調。
         將收集到的 Frames 組合後進行推論，並重置 VAD 等待下一句。
         """
-        logger.info(f"[{self.session_id}] Recording Stopped, processing {len(self.frames)} frames...")
+        logger.info(f"[{self.session_id}][{self.channel_id}] Recording Stopped, processing {len(self.frames)} frames...")
         
         if self.frames:
             # 組合音訊 (frames 是 list of bytes)
@@ -287,6 +294,14 @@ class VADProcessor(AudioToTextRecorder):
 # =========================================================================
 # 核心邏輯層 - GPU 推論引擎
 # =========================================================================
+
+# 訓練資料常見的幻覺/雜訊 (Safe Artifacts only)
+KNOWN_ARTIFACTS = [
+    "字幕由", "Subtitle by", "Amara.org", "MBC News", 
+    "不代表本台", "alugha", "Sous-titres",
+    "點擊訂閱", "Subscribe", "視聴ありがとうございました"
+]
+
 class InferenceEngine:
     def __init__(self):
         self.model = None
@@ -329,10 +344,25 @@ class InferenceEngine:
                 job["audio_data"], 
                 beam_size=5, 
                 language="zh", 
-                initial_prompt="繁體中文會議記錄，對話清晰。"
+                initial_prompt="繁體中文會議記錄，對話清晰。",
+                # [Hallucination Fix 1] 啟用模型內建 VAD 過濾靜音
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
+                # [Hallucination Fix 2] 參數調優
+                temperature=0.0, # Greedy decoding 對抗幻覺
+                condition_on_previous_text=False, # 避免上下文毒化
+                repetition_penalty=1.1 # 抑制重複
             )
             
             text = " ".join([s.text for s in segments]).strip()
+            
+            # [Hallucination Fix 3] 移除已知的訓練雜訊 (Artifact Cleaning)
+            for artifact in KNOWN_ARTIFACTS:
+                if artifact in text:
+                    logger.warning(f"Removed artifact '{artifact}' from: {text}")
+                    text = text.replace(artifact, "")
+            
+            text = text.strip()
 
             if text:
                 logger.info(f"TRANSCRIPTION [{session_id}][{channel_id}]: {text}")
@@ -362,6 +392,10 @@ def worker_dispatcher():
     while True:
         try:
             job = inference_queue.get()
+            if job is None: # Sentinel for shutdown
+                logger.info("Dispatcher received shutdown signal.")
+                break
+                
             # 提交給 ThreadPool
             inference_executor.submit(engine.transcribe, job)
         except Exception as e:
@@ -438,6 +472,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 main_loop = None 
+broadcaster_task = None 
 
 # =========================================================================
 # API 路由層 (FastAPI)
@@ -447,7 +482,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.on_event("startup")
 async def startup():
-    global main_loop, event_bus
+    global main_loop, event_bus, broadcaster_task
     main_loop = asyncio.get_running_loop()
     event_bus = asyncio.Queue()
     
@@ -458,9 +493,31 @@ async def startup():
     threading.Thread(target=worker_dispatcher, daemon=True).start()
     
     # 3. 啟動廣播器 Loop Task
-    asyncio.create_task(broadcaster())
+    broadcaster_task = asyncio.create_task(broadcaster())
     
     logger.info("System Startup Correctly.")
+    
+@app.on_event("shutdown")
+async def shutdown():
+    logger.info("Shutting down system...")
+    
+    # 1. 停止 Broadcaster
+    if broadcaster_task:
+        broadcaster_task.cancel()
+        try:
+            await broadcaster_task
+        except asyncio.CancelledError:
+            pass
+    logger.info("Broadcaster stopped.")
+
+    # 2. 停止 Dispatcher (送入 None 作為 Sentinel)
+    inference_queue.put(None)
+    
+    # 3. 關閉 Thread Pool
+    inference_executor.shutdown(wait=True)
+    logger.info("Inference Executor stopped.")
+    
+    logger.info("System Shutdown Complete.")
 
 async def broadcaster():
     """負責將 event_bus 的資料推給 manager 進行廣播"""

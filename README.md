@@ -40,16 +40,38 @@ python general_stt_server.py
 1.  **音訊串流與轉錄 (Audio Stream)**
     -   URL: `ws://<server_ip>:8000/v1/audio/stream`
     -   Query Params:
-        -   `session_id`: 會議室/Session ID (必填)
+        -   `session_id`: 會議室/Session ID (必填，若缺少將導致 403 Forbidden 或連線拒絕)
         -   `channel_id`: 使用者/聲道 ID (必填)
-        -   `receive_text`: 是否接收轉錄結果 (預設: `True`)
-    -   功能: 接收 PCM 16k 16bit 音訊，並回傳 JSON 轉錄結果。
+        -   `receive_text`: 是否在本通道接收轉錄廣播 (預設: `True`)
+    -   功能: 建立連線後持續接收音訊串流，並即時回傳轉錄出的句子。
+    -   握手配置 (可選): WebSocket 建立好的**第一包訊息**可傳送 JSON 文字作為配置，若直接傳送二進位音訊則使用預設值：
+        ```json
+        {
+            "sample_rate": 16000,
+            "encoding": "pcm_16",
+            "language": "zh"
+        }
+        ```
+    -   資料傳輸: 握手完成後，持續傳送二進制 (Binary) 的 PCM 音訊碎塊。
 
 2.  **事件訂閱 (Event Subscription)**
     -   URL: `ws://<server_ip>:8000/v1/events/sub`
     -   Query Params:
-        -   `session_id`: 會議室/Session ID (必填)
-    -   功能: 僅接收該 Session 的轉錄廣播，不傳送音訊 (適用於監聽端或 SIP Server 控制端)。
+        -   `session_id`: 欲訂閱的 會議室/Session ID (必填，若缺少連線將被直接拒絕返回 403)
+    -   功能: 僅被動接收該 Session 內所有使用者的轉錄廣播，無須傳送音訊。可定期向伺服器發送任意文字訊息作為 Keep-alive (Ping)。
+
+#### 回傳資料格式 (WebSocket 訊息)
+以上端點在有語音段落轉錄完成時，伺服器會廣播以下 JSON 結構文字給有訂閱該 `session_id` 的所有客戶端：
+```json
+{
+    "type": "transcription",
+    "session_id": "test_room",
+    "channel_id": "User_A",
+    "text": "這是一段即時轉錄出來的中文文字。",
+    "timestamp": 1713000000.123,
+    "duration": 2.34
+}
+```
 
 ---
 
