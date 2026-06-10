@@ -3,31 +3,44 @@ import logging
 import os
 import queue
 import threading
+from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Mapping
 
 import torch
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import ValidationError
 
 from .audio import TARGET_SAMPLE_RATE, resample_pcm16
-from .config import build_stt_model_config
+from .config import SttModelConfig, build_stt_model_config
 from .connection_manager import ConnectionManager
-from .inference import InferenceEngine, TranscriptionRuntimeConfig
+from .inference import InferenceEngine, TranscriptionJob, TranscriptionRuntimeConfig
 from .offline import configure_offline_environment, patch_torch_hub_for_offline_silero
-from .schemas import StreamConfig
+from .schemas import StreamConfig, TranscriptionEvent
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("STT-Service")
+logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
-MAX_INFERENCE_WORKERS = 2
+
+
+def _int_from_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        logger.warning("Invalid %s value; using default %s.", name, default)
+        return default
+
+
+MAX_INFERENCE_WORKERS = _int_from_env("STT_MAX_INFERENCE_WORKERS", 1)
+INFERENCE_QUEUE_MAX_SIZE = _int_from_env("STT_INFERENCE_QUEUE_MAX_SIZE", 100)
+MAX_AUDIO_FRAME_BYTES = _int_from_env("STT_MAX_AUDIO_FRAME_BYTES", 1024 * 1024)
+QUERY_ID_MAX_LENGTH = 128
+
+InferenceJob = TranscriptionJob | Mapping[str, Any]
 
 configure_offline_environment(MODELS_DIR)
 patch_torch_hub_for_offline_silero(torch, MODELS_DIR, logger)
@@ -38,20 +51,24 @@ from .vad import VADProcessor  # noqa: E402
 @dataclass
 class SttServerContext:
     models_dir: str
-    inference_queue: queue.Queue = field(default_factory=queue.Queue)
+    model_config: SttModelConfig = field(init=False)
+    inference_queue: queue.Queue[InferenceJob | None] = field(
+        default_factory=lambda: queue.Queue(maxsize=INFERENCE_QUEUE_MAX_SIZE)
+    )
     manager: ConnectionManager = field(
         default_factory=lambda: ConnectionManager(logger)
     )
     inference_executor: ThreadPoolExecutor = field(
         default_factory=lambda: ThreadPoolExecutor(max_workers=MAX_INFERENCE_WORKERS)
     )
-    event_bus: Optional[asyncio.Queue] = None
-    main_loop: Optional[asyncio.AbstractEventLoop] = None
-    broadcaster_task: Optional[asyncio.Task] = None
-    dispatcher_thread: Optional[threading.Thread] = None
+    event_bus: asyncio.Queue[TranscriptionEvent] | None = None
+    main_loop: asyncio.AbstractEventLoop | None = None
+    broadcaster_task: asyncio.Task[None] | None = None
+    dispatcher_thread: threading.Thread | None = None
     engine: InferenceEngine = field(init=False)
+    model_loaded: bool = False
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         self.model_config = build_stt_model_config(self.models_dir)
         logger.info(
             "Selected STT model: %s (device=%s, compute_type=%s)",
@@ -65,11 +82,27 @@ class SttServerContext:
             logger=logger,
         )
 
-    def publish_from_worker(self, event: dict):
-        if self.main_loop and self.event_bus:
-            asyncio.run_coroutine_threadsafe(self.event_bus.put(event), self.main_loop)
+    def publish_from_worker(self, event: TranscriptionEvent) -> None:
+        if not self.main_loop or not self.event_bus:
+            return
 
-    def start_dispatcher(self):
+        publish_coro = self.event_bus.put(event)
+        try:
+            future = asyncio.run_coroutine_threadsafe(publish_coro, self.main_loop)
+        except RuntimeError:
+            publish_coro.close()
+            logger.warning("Failed to publish transcription event.", exc_info=True)
+            return
+
+        def log_publish_error(done_future) -> None:
+            try:
+                done_future.result()
+            except Exception:
+                logger.warning("Failed to publish transcription event.", exc_info=True)
+
+        future.add_done_callback(log_publish_error)
+
+    def start_dispatcher(self) -> None:
         if self.dispatcher_thread and self.dispatcher_thread.is_alive():
             return
         self.dispatcher_thread = threading.Thread(
@@ -77,56 +110,60 @@ class SttServerContext:
         )
         self.dispatcher_thread.start()
 
-    def worker_dispatcher(self):
+    def worker_dispatcher(self) -> None:
         logger.info("Worker Dispatcher Started.")
         while True:
+            job = self.inference_queue.get()
             try:
-                job = self.inference_queue.get()
                 if job is None:
                     logger.info("Dispatcher received shutdown signal.")
                     break
                 self.inference_executor.submit(self.engine.transcribe, job)
-            except Exception as exc:
-                logger.error("Dispatcher Error: %s", exc)
+            except Exception:
+                logger.exception("Dispatcher Error")
+            finally:
+                self.inference_queue.task_done()
 
-    async def shutdown(self):
-        self.inference_queue.put(None)
+    async def shutdown(self) -> None:
+        if self.dispatcher_thread:
+            is_alive = getattr(self.dispatcher_thread, "is_alive", lambda: True)
+            if is_alive():
+                await asyncio.to_thread(self.inference_queue.put, None)
+            await asyncio.to_thread(self.dispatcher_thread.join)
+
         self.inference_executor.shutdown(wait=True)
         logger.info("Inference Executor stopped.")
 
 
-context = SttServerContext(models_dir=MODELS_DIR)
-
-
-async def broadcaster(app_context: SttServerContext = context):
+async def broadcaster(
+    event_bus: asyncio.Queue[TranscriptionEvent],
+    manager: ConnectionManager,
+) -> None:
     while True:
-        if app_context.event_bus:
-            event = await app_context.event_bus.get()
-            await app_context.manager.broadcast(event)
-        else:
-            await asyncio.sleep(0.1)
+        event = await event_bus.get()
+        try:
+            await manager.broadcast(event)
+        except Exception:
+            logger.exception("Broadcast Error")
+        finally:
+            event_bus.task_done()
 
 
-def create_app(app_context: SttServerContext = context) -> FastAPI:
-    service_app = FastAPI(title="STT SIP Server", version="2.0.0")
-    service_app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+def create_app(app_context: SttServerContext | None = None) -> FastAPI:
+    if app_context is None:
+        app_context = SttServerContext(models_dir=MODELS_DIR)
 
-    @service_app.on_event("startup")
-    async def startup():
+    async def startup() -> None:
         app_context.main_loop = asyncio.get_running_loop()
         app_context.event_bus = asyncio.Queue()
-        app_context.engine.load_model()
+        app_context.model_loaded = await asyncio.to_thread(app_context.engine.load_model)
         app_context.start_dispatcher()
-        app_context.broadcaster_task = asyncio.create_task(broadcaster(app_context))
+        app_context.broadcaster_task = asyncio.create_task(
+            broadcaster(app_context.event_bus, app_context.manager)
+        )
         logger.info("System Startup Correctly.")
 
-    @service_app.on_event("shutdown")
-    async def shutdown():
+    async def shutdown() -> None:
         logger.info("Shutting down system...")
         if app_context.broadcaster_task:
             app_context.broadcaster_task.cancel()
@@ -138,11 +175,59 @@ def create_app(app_context: SttServerContext = context) -> FastAPI:
         await app_context.shutdown()
         logger.info("System Shutdown Complete.")
 
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        await startup()
+        try:
+            yield
+        finally:
+            await shutdown()
+
+    service_app = FastAPI(
+        title="STT SIP Server",
+        version="2.0.0",
+        lifespan=lifespan,
+    )
+    service_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @service_app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @service_app.get("/ready")
+    async def ready() -> dict[str, bool]:
+        return {
+            "model_loaded": app_context.model_loaded,
+            "dispatcher_started": bool(
+                app_context.dispatcher_thread
+                and app_context.dispatcher_thread.is_alive()
+            ),
+            "broadcaster_started": bool(
+                app_context.broadcaster_task
+                and not app_context.broadcaster_task.done()
+            ),
+        }
+
     @service_app.websocket("/v1/audio/stream")
     async def audio_stream(
         websocket: WebSocket,
-        session_id: str = Query(..., description="Unique Session ID"),
-        channel_id: str = Query(..., description="Speaker/Channel ID"),
+        session_id: str = Query(
+            ...,
+            min_length=1,
+            max_length=QUERY_ID_MAX_LENGTH,
+            description="Unique Session ID",
+        ),
+        channel_id: str = Query(
+            ...,
+            min_length=1,
+            max_length=QUERY_ID_MAX_LENGTH,
+            description="Speaker/Channel ID",
+        ),
         receive_text: bool = Query(
             True,
             description="Whether to receive transcription on this socket",
@@ -158,17 +243,32 @@ def create_app(app_context: SttServerContext = context) -> FastAPI:
         try:
             first_msg = await websocket.receive()
             config = StreamConfig()
+            first_audio = None
+
+            if first_msg["type"] == "websocket.disconnect":
+                logger.info(
+                    "Stream disconnected before first frame: %s/%s",
+                    session_id,
+                    channel_id,
+                )
+                return
 
             if first_msg["type"] == "websocket.receive" and "text" in first_msg:
                 try:
                     config = StreamConfig.model_validate_json(first_msg["text"])
                     logger.info("Stream config: %s", config)
-                except Exception:
-                    logger.warning(
-                        "First message was text but not valid config, using defaults."
+                except ValidationError as exc:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "code": "INVALID_STREAM_CONFIG",
+                            "message": str(exc),
+                        }
                     )
+                    await websocket.close(code=1003)
+                    return
             elif first_msg["type"] == "websocket.receive" and "bytes" in first_msg:
-                pass
+                first_audio = first_msg["bytes"]
 
             vad_processor = VADProcessor(
                 session_id=session_id,
@@ -181,26 +281,41 @@ def create_app(app_context: SttServerContext = context) -> FastAPI:
             )
             vad_processor.start()
 
-            if "bytes" in first_msg and first_msg["bytes"]:
-                vad_processor.feed_audio(first_msg["bytes"])
+            if first_audio:
+                if len(first_audio) > MAX_AUDIO_FRAME_BYTES:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "code": "AUDIO_FRAME_TOO_LARGE",
+                            "message": "Audio frame exceeds maximum size.",
+                        }
+                    )
+                    await websocket.close(code=1009)
+                    return
+                if config.sample_rate != TARGET_SAMPLE_RATE:
+                    first_audio = resample_pcm16(first_audio, config.sample_rate)
+                vad_processor.feed_audio(first_audio)
 
             while True:
                 data = await websocket.receive_bytes()
+                if len(data) > MAX_AUDIO_FRAME_BYTES:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "code": "AUDIO_FRAME_TOO_LARGE",
+                            "message": "Audio frame exceeds maximum size.",
+                        }
+                    )
+                    await websocket.close(code=1009)
+                    return
                 if config.sample_rate != TARGET_SAMPLE_RATE:
                     data = resample_pcm16(data, config.sample_rate)
                 vad_processor.feed_audio(data)
 
         except WebSocketDisconnect:
             logger.info("Stream disconnected: %s/%s", session_id, channel_id)
-        except Exception as exc:
-            if "ConnectionClosed" in str(type(exc).__name__):
-                logger.info(
-                    "Stream disconnected (ConnectionClosed): %s/%s",
-                    session_id,
-                    channel_id,
-                )
-            else:
-                logger.error("Stream error: %s", exc)
+        except Exception:
+            logger.exception("Stream error")
         finally:
             if vad_processor:
                 vad_processor.shutdown()
@@ -210,14 +325,21 @@ def create_app(app_context: SttServerContext = context) -> FastAPI:
     @service_app.websocket("/v1/events/sub")
     async def event_subscription(
         websocket: WebSocket,
-        session_id: str = Query(..., description="Session ID to subscribe"),
-    ):
+        session_id: str = Query(
+            ...,
+            min_length=1,
+            max_length=QUERY_ID_MAX_LENGTH,
+            description="Session ID to subscribe",
+        ),
+    ) -> None:
         await websocket.accept()
         await app_context.manager.connect(session_id, websocket)
         try:
             while True:
                 await websocket.receive_text()
         except WebSocketDisconnect:
+            pass
+        finally:
             await app_context.manager.disconnect(session_id, websocket)
 
     return service_app
@@ -226,7 +348,9 @@ def create_app(app_context: SttServerContext = context) -> FastAPI:
 app = create_app()
 
 
-def run():
+def run() -> None:
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    host = os.getenv("STT_HOST", "0.0.0.0")
+    port = _int_from_env("STT_PORT", 8000)
+    uvicorn.run(app, host=host, port=port)
