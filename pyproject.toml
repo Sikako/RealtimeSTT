@@ -20,6 +20,9 @@ dependencies = [
 
 [tool.uv.sources]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.4.2",
