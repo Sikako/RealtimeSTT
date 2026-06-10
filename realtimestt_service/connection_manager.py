@@ -1,18 +1,18 @@
 import asyncio
 import json
 import logging
-from typing import Dict, Set, Optional
+from typing import Mapping
 
 from fastapi import WebSocket
 
 
 class ConnectionManager:
-    def __init__(self, logger: Optional[logging.Logger] = None):
-        self.rooms: Dict[str, Set[WebSocket]] = {}
+    def __init__(self, logger: logging.Logger | None = None):
+        self.rooms: dict[str, set[WebSocket]] = {}
         self.lock = asyncio.Lock()
         self.logger = logger or logging.getLogger(__name__)
 
-    async def connect(self, session_id: str, ws: WebSocket):
+    async def connect(self, session_id: str, ws: WebSocket) -> None:
         async with self.lock:
             if session_id not in self.rooms:
                 self.rooms[session_id] = set()
@@ -23,7 +23,7 @@ class ConnectionManager:
                 len(self.rooms[session_id]),
             )
 
-    async def disconnect(self, session_id: str, ws: WebSocket):
+    async def disconnect(self, session_id: str, ws: WebSocket) -> None:
         async with self.lock:
             if session_id in self.rooms:
                 self.rooms[session_id].discard(ws)
@@ -31,9 +31,9 @@ class ConnectionManager:
                     del self.rooms[session_id]
         self.logger.info("Client left session %s.", session_id)
 
-    async def broadcast(self, event: dict):
+    async def broadcast(self, event: Mapping[str, object]) -> None:
         session_id = event.get("session_id")
-        if not session_id:
+        if not isinstance(session_id, str) or not session_id:
             return
 
         async with self.lock:

@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import Mapping
 
 
 BREEZE_ASR_25_DIRNAME = "faster-whisper-Breeze-ASR-25"
@@ -19,15 +19,15 @@ class SttModelConfig:
     initial_prompt: str
 
 
-def _env(environ: Optional[Mapping[str, str]]) -> Mapping[str, str]:
+def _env(environ: Mapping[str, str] | None) -> Mapping[str, str]:
     return os.environ if environ is None else environ
 
 
-def _existing_dir(path: str) -> Optional[str]:
+def _existing_dir(path: str) -> str | None:
     return path if path and os.path.isdir(path) else None
 
 
-def _find_breeze_asr_25_model(models_dir: str) -> Optional[str]:
+def _find_breeze_asr_25_model(models_dir: str) -> str | None:
     exact_path = os.path.join(models_dir, BREEZE_ASR_25_DIRNAME)
     if os.path.isdir(exact_path):
         return exact_path
@@ -42,7 +42,7 @@ def _find_breeze_asr_25_model(models_dir: str) -> Optional[str]:
     return None
 
 
-def _find_fallback_whisper_model(models_dir: str) -> Optional[str]:
+def _find_fallback_whisper_model(models_dir: str) -> str | None:
     if not os.path.isdir(models_dir):
         return None
 
@@ -55,7 +55,7 @@ def _find_fallback_whisper_model(models_dir: str) -> Optional[str]:
 
 
 def resolve_model_path(
-    models_dir: str, environ: Optional[Mapping[str, str]] = None
+    models_dir: str, environ: Mapping[str, str] | None = None
 ) -> str:
     values = _env(environ)
     explicit_path = _existing_dir(values.get("STT_MODEL_PATH", ""))
@@ -77,7 +77,7 @@ def resolve_model_path(
 
 def build_stt_model_config(
     models_dir: str,
-    environ: Optional[Mapping[str, str]] = None,
+    environ: Mapping[str, str] | None = None,
 ) -> SttModelConfig:
     values = _env(environ)
     return SttModelConfig(

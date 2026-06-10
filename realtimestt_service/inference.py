@@ -1,9 +1,10 @@
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Optional, Sequence, Union
+from typing import Any, Callable, Mapping, Sequence
 
 from .config import SttModelConfig, load_faster_whisper_model
+from .schemas import TranscriptionEvent
 
 
 KNOWN_ARTIFACTS = (
@@ -73,8 +74,8 @@ class InferenceEngine:
         model_loader: Callable[
             [TranscriptionRuntimeConfig], Any
         ] = default_model_loader,
-        event_publisher: Optional[Callable[[dict], None]] = None,
-        logger: Optional[logging.Logger] = None,
+        event_publisher: Callable[[TranscriptionEvent], None] | None = None,
+        logger: logging.Logger | None = None,
     ):
         self.config = config
         self.model_loader = model_loader
@@ -104,8 +105,8 @@ class InferenceEngine:
             return False
 
     def transcribe(
-        self, job: Union[TranscriptionJob, Mapping[str, Any]]
-    ) -> Optional[dict]:
+        self, job: TranscriptionJob | Mapping[str, Any]
+    ) -> TranscriptionEvent | None:
         if not self.model:
             self.logger.error("Model not initialized!")
             return None
@@ -132,7 +133,7 @@ class InferenceEngine:
             if not text:
                 return None
 
-            result = {
+            result: TranscriptionEvent = {
                 "type": "transcription",
                 "session_id": transcription_job.session_id,
                 "channel_id": transcription_job.channel_id,
