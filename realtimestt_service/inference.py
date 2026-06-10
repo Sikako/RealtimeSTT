@@ -21,11 +21,7 @@ KNOWN_ARTIFACTS = (
 
 
 @dataclass(frozen=True)
-class TranscriptionRuntimeConfig:
-    model_path: str
-    device: str
-    compute_type: str
-    initial_prompt: str
+class TranscriptionRuntimeConfig(SttModelConfig):
 
     @classmethod
     def from_stt_config(cls, config: SttModelConfig) -> "TranscriptionRuntimeConfig":
