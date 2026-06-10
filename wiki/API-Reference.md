@@ -2,7 +2,35 @@
 
 ## 概述
 
-本文檔提供 general_stt_server 的完整 API 規格說明，包含所有 WebSocket 端點、訊息格式、錯誤代碼等。
+本文檔提供 general_stt_server 的完整 API 規格說明，包含健康檢查、readiness、WebSocket 端點、訊息格式、錯誤代碼等。
+
+## HTTP 端點
+
+### 1. 健康檢查
+
+- **URL**: `GET http://{host}:{port}/health`
+- **用途**: 確認 process 是否存活。
+
+**回應**:
+```json
+{
+  "status": "ok"
+}
+```
+
+### 2. Readiness
+
+- **URL**: `GET http://{host}:{port}/ready`
+- **用途**: 確認模型與背景任務是否已完成啟動。
+
+**回應**:
+```json
+{
+  "model_loaded": true,
+  "dispatcher_started": true,
+  "broadcaster_started": true
+}
+```
 
 ## WebSocket 端點
 
@@ -18,8 +46,8 @@
 
 | 參數 | 類型 | 必填 | 預設值 | 說明 |
 |------|------|------|--------|------|
-| `session_id` | string | ✅ | - | Session 識別碼，用於區分不同的轉錄任務 |
-| `channel_id` | string | ✅ | - | 聲道識別碼，標識音訊來源（如使用者名稱） |
+| `session_id` | string | ✅ | - | Session 識別碼，用於區分不同的轉錄任務，長度 `1-128` |
+| `channel_id` | string | ✅ | - | 聲道識別碼，標識音訊來源（如使用者名稱），長度 `1-128` |
 | `receive_text` | boolean | ❌ | `true` | 是否接收轉錄結果廣播 |
 
 #### 連線範例
@@ -92,8 +120,8 @@ asyncio.run(audio_stream())
 **Schema**:
 ```json
 {
-  "sample_rate": 16000,      // int, 取樣率 (Hz)
-  "encoding": "pcm_16",      // string, 編碼格式
+  "sample_rate": 16000,      // int, 取樣率 (Hz)，允許 8000-48000
+  "encoding": "pcm_16",      // string, 目前只支援 pcm_16
   "language": "zh"           // string, 語言代碼 (可選)
 }
 ```
@@ -114,6 +142,16 @@ asyncio.run(audio_stream())
 - `ko`: 韓文
 - 完整列表參考: [Whisper Language Codes](https://github.com/openai/whisper/blob/main/whisper/tokenizer.py)
 
+若設定訊息不符合 schema，server 會送出錯誤並以 `1003` 關閉連線：
+
+```json
+{
+  "type": "error",
+  "code": "INVALID_STREAM_CONFIG",
+  "message": "..."
+}
+```
+
 ##### 2. 音訊資料
 
 **方向**: Client → Server
@@ -126,8 +164,19 @@ asyncio.run(audio_stream())
 - **位元深度**: 16-bit signed integer
 - **聲道數**: Mono (單聲道)
 - **位元組序**: Little Endian
+- **單一 frame 大小**: 預設上限 `1048576` bytes，可用 `STT_MAX_AUDIO_FRAME_BYTES` 調整
 
 **區塊大小建議**: 1024 samples = 2048 bytes
+
+若單一 binary frame 超過限制，server 會送出錯誤並以 `1009` 關閉連線：
+
+```json
+{
+  "type": "error",
+  "code": "AUDIO_FRAME_TOO_LARGE",
+  "message": "Audio frame exceeds maximum size."
+}
+```
 
 **範例 (Python)**:
 ```python
@@ -204,7 +253,7 @@ for i in range(0, len(audio_bytes), bytes_per_chunk):
 
 | 參數 | 類型 | 必填 | 預設值 | 說明 |
 |------|------|------|--------|------|
-| `session_id` | string | ✅ | - | 要訂閱的 Session ID |
+| `session_id` | string | ✅ | - | 要訂閱的 Session ID，長度 `1-128` |
 
 #### 連線範例
 
@@ -293,18 +342,17 @@ ws.onerror = (error) => {
 
 ### 伺服器端錯誤
 
-**當前實作**: 伺服器不會主動發送錯誤訊息，僅在日誌中記錄
-
-**未來擴展**: 可加入錯誤訊息
+目前會針對 client 可修正的 protocol 錯誤主動回覆 JSON error，例如：
 
 ```json
 {
   "type": "error",
-  "session_id": "room1",
-  "error": "VAD detection failed",
-  "code": 500
+  "code": "INVALID_STREAM_CONFIG",
+  "message": "..."
 }
 ```
+
+推論、VAD 或廣播期間的非預期錯誤會記錄在 server log；服務會盡量清理連線並繼續處理後續任務。
 
 ---
 
@@ -505,7 +553,8 @@ general_stt_server 提供簡潔但功能完整的 WebSocket API：
 - ✅ 兩個端點（音訊 + 事件）
 - ✅ 簡單的訊息格式（JSON + Binary）
 - ✅ Room 廣播機制
-- ✅ 彈性配置（語言、取樣率）
+- ✅ 彈性配置（語言、取樣率，並驗證 encoding 與 sample rate）
+- ✅ 健康檢查與 readiness endpoint
 - ✅ 易於整合（標準 WebSocket）
 
 API 設計以簡單、直觀為原則，方便開發者快速整合。

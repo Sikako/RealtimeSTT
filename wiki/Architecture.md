@@ -48,7 +48,7 @@ general_stt_server 採用分層架構設計，將語音轉錄流程分為四個�
 
 #### FastAPI Application
 ```python
-app = FastAPI(title="STT SIP Server", version="2.0.0")
+app = FastAPI(title="STT SIP Server", version="2.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, ...)
 ```
 
@@ -57,13 +57,15 @@ app.add_middleware(CORSMiddleware, ...)
 - WebSocket 連線管理
 - CORS 中介軟體
 - 請求驗證
+- Lifespan 啟動與關閉管理
+- `/health` 與 `/ready` 服務狀態檢查
 
 #### ConnectionManager
 ```python
 class ConnectionManager:
     def __init__(self):
         # session_id -> Set[WebSocket]
-        self.rooms: Dict[str, Set[WebSocket]] = {}
+        self.rooms: dict[str, set[WebSocket]] = {}
 ```
 
 **功能**:
@@ -128,7 +130,6 @@ AudioToTextRecorder._transcription_worker = dummy_worker
 class InferenceEngine:
     def __init__(self):
         self.model = None  # WhisperModel 實例
-        self.lock = threading.Lock()
 ```
 
 **模型載入**:
@@ -164,8 +165,8 @@ def transcribe(self, job: dict):
 
 **組件**:
 ```python
-inference_queue = queue.Queue()        # VAD → GPU Worker
-event_bus = asyncio.Queue()            # GPU → WebSocket Broadcaster
+inference_queue = queue.Queue(maxsize=100)  # VAD → GPU Worker
+event_bus = asyncio.Queue()                 # GPU → WebSocket Broadcaster
 ```
 
 **資料流**:
@@ -182,7 +183,12 @@ def worker_dispatcher():
     """從 Queue 取出並分發給 ThreadPool"""
     while True:
         job = inference_queue.get()
-        inference_executor.submit(engine.transcribe, job)
+        try:
+            if job is None:
+                break
+            inference_executor.submit(engine.transcribe, job)
+        finally:
+            inference_queue.task_done()
 ```
 
 **特點**:
@@ -193,7 +199,7 @@ def worker_dispatcher():
 #### ThreadPoolExecutor
 
 ```python
-MAX_INFERENCE_WORKERS = 2
+MAX_INFERENCE_WORKERS = int(os.getenv("STT_MAX_INFERENCE_WORKERS", "1"))
 inference_executor = ThreadPoolExecutor(max_workers=MAX_INFERENCE_WORKERS)
 ```
 
@@ -202,6 +208,8 @@ inference_executor = ThreadPoolExecutor(max_workers=MAX_INFERENCE_WORKERS)
 - 自動管理執行緒生命週期
 - 支援 Future 模式（目前未使用）
 
+預設使用 `1` 個 worker，避免同一個 faster-whisper / CTranslate2 模型實例在未確認 thread-safe 前被多個 worker 並行呼叫。確認部署環境可安全並行或改成每個 worker 持有獨立模型後，再調高 `STT_MAX_INFERENCE_WORKERS`。
+
 #### Event Broadcaster
 
 ```python
@@ -209,7 +217,12 @@ async def broadcaster():
     """負責將 event_bus 的資料推給 manager 進行廣播"""
     while True:
         event = await event_bus.get()
-        await manager.broadcast(event)
+        try:
+            await manager.broadcast(event)
+        except Exception:
+            logger.exception("Broadcast Error")
+        finally:
+            event_bus.task_done()
 ```
 
 **特點**:
@@ -272,7 +285,7 @@ general_stt_server (Threading):
 | WebSocket Handler | N (動態) | 接收客戶端音訊 |
 | VAD Thread | N (動態) | 每個 WebSocket 一個 VAD 處理器 |
 | Dispatcher Thread | 1 | 分發推論任務 |
-| Inference Worker | 2-8 (可配置) | 執行 GPU 推論 |
+| Inference Worker | 預設 1，可用 `STT_MAX_INFERENCE_WORKERS` 調整 | 執行 GPU 推論 |
 | Broadcaster Task | 1 (asyncio) | 廣播轉錄結果 |
 
 ## 生命週期管理
@@ -280,16 +293,24 @@ general_stt_server (Threading):
 ### 啟動流程
 
 ```python
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     # 1. 載入模型
-    engine.load_model()
+    model_loaded = await asyncio.to_thread(engine.load_model)
     
     # 2. 啟動 Dispatcher
     threading.Thread(target=worker_dispatcher, daemon=True).start()
     
     # 3. 啟動 Broadcaster
-    asyncio.create_task(broadcaster())
+    broadcaster_task = asyncio.create_task(broadcaster(event_bus, manager))
+
+    try:
+        yield
+    finally:
+        broadcaster_task.cancel()
+        inference_queue.put(None)
+        dispatcher_thread.join()
+        inference_executor.shutdown(wait=True)
 ```
 
 ### 連線生命週期
@@ -324,6 +345,8 @@ def shutdown(self):
     self.parent_transcription_pipe.close()
     gc.collect()
 ```
+
+服務層關閉時會先取消 broadcaster，再向 dispatcher 送出 `None` sentinel，等待 dispatcher thread 結束後才關閉 `ThreadPoolExecutor`，避免 dispatcher 在 executor shutdown 後繼續 `submit()`。
 
 ## 錯誤處理
 
@@ -385,7 +408,7 @@ Client → Load Balancer → Server 1 (VAD) → Redis Queue → GPU Server 1
 
 ```python
 # 多 GPU 配置
-MAX_INFERENCE_WORKERS = 16  # 每張 GPU 8 Workers
+MAX_INFERENCE_WORKERS = 16  # 每張 GPU 8 Workers，需改為每個 worker 持有獨立模型
 devices = [0, 1]  # 使用 GPU 0 和 1
 
 # Worker 分配

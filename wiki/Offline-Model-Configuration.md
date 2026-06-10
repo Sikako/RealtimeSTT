@@ -366,8 +366,8 @@ def verify_whisper_model():
 ### 啟動時驗證
 
 ```python
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     # 驗證模型
     if not verify_vad_model():
         logger.error("VAD model not available. Please download it first.")
@@ -376,8 +376,13 @@ async def startup():
     if not verify_whisper_model():
         logger.error("Whisper model not available. Please download it first.")
     
-    # 載入模型
-    engine.load_model()
+    # 載入模型；load_model 是同步函式，避免直接阻塞 event loop
+    model_loaded = await asyncio.to_thread(engine.load_model)
+
+    try:
+        yield
+    finally:
+        await shutdown_runtime()
 ```
 
 ## 故障排除

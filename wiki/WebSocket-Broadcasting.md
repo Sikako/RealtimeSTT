@@ -252,6 +252,8 @@ async def event_subscription(
         while True:
             await websocket.receive_text()  # Keep alive
     except WebSocketDisconnect:
+        pass
+    finally:
         await manager.disconnect(session_id, websocket)
 ```
 
