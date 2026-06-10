@@ -155,19 +155,53 @@ python general_stt_server.py
 
 1. 載入 Whisper 模型到設定的裝置。
 2. 初始化 VAD 引擎。
-3. 啟動推論工作執行緒池。
+3. 啟動 bounded inference queue 與推論工作執行緒池。
 4. 監聽 WebSocket 連線，預設 `0.0.0.0:8000`。
+
+監聽位址可透過環境變數調整：
+
+```powershell
+$env:STT_HOST = "127.0.0.1"
+$env:STT_PORT = "8000"
+python general_stt_server.py
+```
 
 ### API 端點
 
-#### 1. 音訊串流與轉錄端點
+#### 1. 健康檢查端點
+
+**端點**: `GET http://<server_ip>:8000/health`
+
+用於確認 process 是否仍存活。
+
+```json
+{
+  "status": "ok"
+}
+```
+
+#### 2. Readiness 端點
+
+**端點**: `GET http://<server_ip>:8000/ready`
+
+用於確認模型、dispatcher 與 broadcaster 是否已完成啟動。
+
+```json
+{
+  "model_loaded": true,
+  "dispatcher_started": true,
+  "broadcaster_started": true
+}
+```
+
+#### 3. 音訊串流與轉錄端點
 
 **端點**: `ws://<server_ip>:8000/v1/audio/stream`
 
 **Query 參數**:
 
-- `session_id` (必填): 會議室/Session ID，用於區分不同的轉錄任務。
-- `channel_id` (必填): 使用者/聲道 ID，用於標識音訊來源。
+- `session_id` (必填): 會議室/Session ID，用於區分不同的轉錄任務，長度 `1-128`。
+- `channel_id` (必填): 使用者/聲道 ID，用於標識音訊來源，長度 `1-128`。
 - `receive_text` (選填): 是否接收轉錄結果，預設 `true`。
 
 **連線流程**:
@@ -188,12 +222,32 @@ const ws = new WebSocket("ws://localhost:8000/v1/audio/stream?session_id=room1&c
 }
 ```
 
+目前只支援 `encoding="pcm_16"`，`sample_rate` 必須介於 `8000` 到 `48000`。設定格式錯誤時，server 會回傳錯誤並關閉連線：
+
+```json
+{
+  "type": "error",
+  "code": "INVALID_STREAM_CONFIG",
+  "message": "..."
+}
+```
+
 3. 發送 PCM 音訊流。
 
 ```python
 while True:
     audio_chunk = get_audio_data()
     await websocket.send(audio_chunk)
+```
+
+單一 WebSocket binary frame 預設限制為 `1MB`。超過限制時會回傳：
+
+```json
+{
+  "type": "error",
+  "code": "AUDIO_FRAME_TOO_LARGE",
+  "message": "Audio frame exceeds maximum size."
+}
 ```
 
 4. 接收轉錄結果。
@@ -209,13 +263,13 @@ while True:
 }
 ```
 
-#### 2. 事件訂閱端點
+#### 4. 事件訂閱端點
 
 **端點**: `ws://<server_ip>:8000/v1/events/sub`
 
 **Query 參數**:
 
-- `session_id` (必填): 要訂閱的 Session ID。
+- `session_id` (必填): 要訂閱的 Session ID，長度 `1-128`。
 
 **連線範例**:
 
@@ -284,6 +338,11 @@ ffmpeg -i input.mp3 -ar 16000 -ac 1 -sample_fmt s16 output.wav
 | `STT_DEVICE` | `cuda` | faster-whisper 載入裝置。 |
 | `STT_COMPUTE_TYPE` | `float16` | faster-whisper compute type。 |
 | `STT_INITIAL_PROMPT` | `繁體中文會議記錄，台灣華語，中英混用，對話清晰。` | 轉錄 initial prompt。 |
+| `STT_HOST` | `0.0.0.0` | `python general_stt_server.py` 啟動時的監聽 host。 |
+| `STT_PORT` | `8000` | `python general_stt_server.py` 啟動時的監聽 port。 |
+| `STT_MAX_INFERENCE_WORKERS` | `1` | 推論 worker 數量。預設使用單 worker，避免同一模型實例被多個 thread 並行呼叫。 |
+| `STT_INFERENCE_QUEUE_MAX_SIZE` | `100` | 待推論音訊片段 queue 容量；滿載時新的片段會被丟棄並記錄 warning。 |
+| `STT_MAX_AUDIO_FRAME_BYTES` | `1048576` | 單一 WebSocket binary frame 最大大小。 |
 
 ### 離線與 threading patch
 
@@ -297,9 +356,11 @@ ffmpeg -i input.mp3 -ar 16000 -ac 1 -sample_fmt s16 output.wav
 
 1. 調整並行推論數量。
 
-```python
-MAX_INFERENCE_WORKERS = 2
+```powershell
+$env:STT_MAX_INFERENCE_WORKERS = "1"
 ```
+
+預設值為 `1`，因為 faster-whisper / CTranslate2 的同一模型實例是否可安全並行推論需依部署環境確認。若確認可安全並行或改為每個 worker 持有獨立模型實例，再調高此值。
 
 2. 選擇適當的模型大小。
 
@@ -346,7 +407,7 @@ post_speech_silence_duration = 0.6
 
 可嘗試：
 
-- 減少 `MAX_INFERENCE_WORKERS`。
+- 減少 `STT_MAX_INFERENCE_WORKERS`。
 - 使用較小模型，例如 `small` 或 `tiny`。
 - 設定 `STT_COMPUTE_TYPE=int8`。
 
