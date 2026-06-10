@@ -16,4 +16,5 @@ def resample_pcm16(
     if num_samples <= 0:
         return b""
 
-    return scipy.signal.resample(audio_np, num_samples).astype(np.int16).tobytes()
+    resampled_audio = scipy.signal.resample(audio_np, num_samples)
+    return np.asarray(resampled_audio, dtype=np.int16).tobytes()
