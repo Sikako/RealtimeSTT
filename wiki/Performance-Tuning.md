@@ -95,7 +95,9 @@ VRAM > 16GB → large + 增加並行數
 
 ### 2. 調整並行 Worker 數量
 
-**公式**:
+預設 `STT_MAX_INFERENCE_WORKERS=1`，避免同一個 faster-whisper / CTranslate2 model instance 在未確認 thread-safe 前被多個 worker 並行呼叫。若確認部署環境可安全並行，或改成每個 worker 持有獨立模型，可再調高。
+
+**估算公式**:
 ```
 MAX_INFERENCE_WORKERS = floor(GPU_VRAM / MODEL_VRAM) - 1
 ```
@@ -112,17 +114,12 @@ MAX_INFERENCE_WORKERS = floor(16 / 5) - 1 = 3 - 1 = 2
 ```
 
 **實際配置**:
-```python
-# general_stt_server.py
+```powershell
+# 保守（預設，穩定優先）
+$env:STT_MAX_INFERENCE_WORKERS = "1"
 
-# 保守（穩定優先）
-MAX_INFERENCE_WORKERS = 2
-
-# 積極（效能優先）
-MAX_INFERENCE_WORKERS = 4
-
-# 超頻（需監控溫度）
-MAX_INFERENCE_WORKERS = 6
+# 確認模型實例可安全並行後再調高
+$env:STT_MAX_INFERENCE_WORKERS = "2"
 ```
 
 ### 3. 計算型別優化
@@ -330,7 +327,7 @@ for i in range(0, len(audio_data), chunk_size):
 
 **基本公式**:
 ```
-MAX_INFERENCE_WORKERS = min(
+STT_MAX_INFERENCE_WORKERS = min(
     CPU_CORES,
     GPU_VRAM / MODEL_VRAM,
     MAX_CONCURRENT_USERS / AVG_SPEECH_RATE
@@ -358,18 +355,14 @@ Workers = min(
 
 **避免記憶體溢出**:
 ```python
-# 當前: 無界佇列
-inference_queue = queue.Queue()
-
-# 優化: 限制深度
+# 目前實作: 限制深度，預設 100，可用 STT_INFERENCE_QUEUE_MAX_SIZE 調整
 inference_queue = queue.Queue(maxsize=100)
 
 # VADProcessor 中處理滿佇列
 try:
-    inference_queue.put_nowait(job)
+    inference_queue.put(job, timeout=1)
 except queue.Full:
-    logger.warning("Queue full, dropping job")
-    # 或實作重試邏輯
+    logger.warning("Inference queue is full; dropping audio segment.")
 ```
 
 ### 3. 批次推論（進階）

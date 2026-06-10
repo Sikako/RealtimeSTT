@@ -39,8 +39,11 @@ def perform_final_transcription(self, audio_bytes=None, use_prompt=True) -> str:
         "language": self.language or "zh"
     }
     
-    # 放入佇列
-    inference_queue.put(job)
+    # 放入 bounded queue；滿載時丟棄此片段並記錄 warning
+    try:
+        inference_queue.put(job, timeout=1)
+    except queue.Full:
+        logger.warning("Inference queue is full; dropping audio segment.")
 ```
 
 **關鍵操作**:
@@ -51,13 +54,14 @@ def perform_final_transcription(self, audio_bytes=None, use_prompt=True) -> str:
 #### (2) 任務佇列 - inference_queue
 
 ```python
-inference_queue = queue.Queue()  # 無界佇列
+inference_queue = queue.Queue(maxsize=100)
 ```
 
 **特性**:
 - **Thread-safe**: 內建執行緒鎖
 - **阻塞式**: `put()` 和 `get()` 可阻塞
 - **FIFO**: 先進先出
+- **有界容量**: 預設最多 100 個待推論片段，避免高併發時無限制吃掉記憶體
 
 **為何使用 Queue？**
 - 解耦 VAD 與推論
@@ -70,11 +74,15 @@ inference_queue = queue.Queue()  # 無界佇列
 def worker_dispatcher():
     logger.info("Worker Dispatcher Started.")
     while True:
+        job = inference_queue.get()  # 阻塞等待
         try:
-            job = inference_queue.get()  # 阻塞等待
+            if job is None:
+                break
             inference_executor.submit(engine.transcribe, job)
-        except Exception as e:
-            logger.error(f"Dispatcher Error: {e}")
+        except Exception:
+            logger.exception("Dispatcher Error")
+        finally:
+            inference_queue.task_done()
 ```
 
 **責任**:
@@ -90,7 +98,7 @@ def worker_dispatcher():
 #### (4) 執行緒池 - ThreadPoolExecutor
 
 ```python
-MAX_INFERENCE_WORKERS = 2
+MAX_INFERENCE_WORKERS = int(os.getenv("STT_MAX_INFERENCE_WORKERS", "1"))
 inference_executor = ThreadPoolExecutor(max_workers=MAX_INFERENCE_WORKERS)
 ```
 
@@ -103,10 +111,12 @@ inference_executor = ThreadPoolExecutor(max_workers=MAX_INFERENCE_WORKERS)
 
 | GPU VRAM | 模型大小 | 建議 Workers |
 |----------|---------|-------------|
-| 4GB      | tiny/small | 2-4 |
-| 8GB      | medium | 2-4 |
-| 12GB     | medium/large | 4-6 |
-| 16GB+    | large | 6-8 |
+| 4GB      | tiny/small | 1-2 |
+| 8GB      | medium | 1-2 |
+| 12GB     | medium/large | 1-3 |
+| 16GB+    | large | 1-4 |
+
+預設值為 `1`。若要調高 worker 數量，需先確認同一個 faster-whisper / CTranslate2 model instance 在部署環境中可安全並行呼叫，或改為每個 worker 持有獨立模型。
 
 #### (5) 推論引擎 - InferenceEngine
 
@@ -408,23 +418,22 @@ def transcribe(self, job: dict):
 ```
 
 **常見錯誤**:
-- CUDA OOM: 減少 `MAX_INFERENCE_WORKERS`
+- CUDA OOM: 減少 `STT_MAX_INFERENCE_WORKERS`
 - 音訊格式錯誤: 檢查 VAD 輸出
 - 模型損壞: 重新下載模型
 
 ### 佇列溢出
 
-**當前**: 使用無界佇列（可能記憶體溢出）
+**目前實作**: 使用 bounded queue，預設容量 `100`，可透過 `STT_INFERENCE_QUEUE_MAX_SIZE` 調整。
 
-**改進方案**:
 ```python
 inference_queue = queue.Queue(maxsize=100)  # 限制大小
 
 # VADProcessor
 try:
-    inference_queue.put_nowait(job)
+    inference_queue.put(job, timeout=1)
 except queue.Full:
-    logger.warning("Inference queue full, dropping job")
+    logger.warning("Inference queue is full; dropping audio segment.")
 ```
 
 ## 監控與除錯
