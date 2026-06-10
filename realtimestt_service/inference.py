@@ -22,7 +22,6 @@ KNOWN_ARTIFACTS = (
 
 @dataclass(frozen=True)
 class TranscriptionRuntimeConfig(SttModelConfig):
-
     @classmethod
     def from_stt_config(cls, config: SttModelConfig) -> "TranscriptionRuntimeConfig":
         return cls(
@@ -104,7 +103,9 @@ class InferenceEngine:
             self.logger.error("Failed to load model: %s", exc)
             return False
 
-    def transcribe(self, job: Union[TranscriptionJob, Mapping[str, Any]]) -> Optional[dict]:
+    def transcribe(
+        self, job: Union[TranscriptionJob, Mapping[str, Any]]
+    ) -> Optional[dict]:
         if not self.model:
             self.logger.error("Model not initialized!")
             return None
