@@ -325,6 +325,30 @@ python general_stt_client.py --mode file --path ./test_audio.wav --user FileBot 
 ffmpeg -i input.mp3 -ar 16000 -ac 1 -sample_fmt s16 output.wav
 ```
 
+### 自動測試與手動 demo
+
+自動測試使用 pytest，不會開麥克風，也不會下載模型：
+
+```powershell
+uv run python -m pytest
+```
+
+`examples/realtimestt_live_demo.py` 是手動互動 demo，不屬於 pytest 測試。它會開啟麥克風，並可選擇把轉錄文字輸入到目前焦點視窗。預設採離線模式，缺少本機模型時會直接停止，不會自動下載：
+
+```powershell
+uv run python examples/realtimestt_live_demo.py `
+  --model .\models\faster-whisper-small `
+  --root .\models
+```
+
+若確定要允許 RealtimeSTT / faster-whisper / torch.hub 下載缺少的模型，需明確加上：
+
+```powershell
+uv run python examples/realtimestt_live_demo.py --allow-download
+```
+
+若要讓 demo 將最終轉錄文字輸入到目前焦點視窗，需明確加上 `--write-to-keyboard`。
+
 ## 離線環境配置
 
 本專案已針對離線環境做特殊處理，相關設定位於 `realtimestt_service.offline` 與 `realtimestt_service.config`。

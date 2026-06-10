@@ -1,44 +1,57 @@
+"""Manual RealtimeSTT microphone demo.
+
+This is intentionally not a pytest test. It opens the microphone, can type
+transcribed text into the active window, and may download models only when
+started with --allow-download.
+"""
+
 EXTENDED_LOGGING = False
 
-# set to 0 to deactivate writing to keyboard
-# try lower values like 0.002 (fast) first, take higher values like 0.05 in case it fails
-WRITE_TO_KEYBOARD_INTERVAL = 0.002
+DEFAULT_MODEL_DIRNAME = "faster-whisper-small"
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Start the realtime Speech-to-Text (STT) test with various configuration options."
+        description="Start the manual realtime Speech-to-Text (STT) microphone demo."
     )
 
     parser.add_argument(
         "-m",
         "--model",
-        type=str,  # no default='large-v2',
-        help="Path to the STT model or model size. Options include: tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v1, large-v2, or any huggingface CTranslate2 STT model such as deepdml/faster-whisper-large-v3-turbo-ct2. Default is large-v2.",
+        type=str,
+        help=(
+            "Local STT model path, model size, or Hugging Face CTranslate2 model. "
+            "Without --allow-download this must be an existing local path. "
+            "Default is models/faster-whisper-small."
+        ),
     )
 
     parser.add_argument(
         "-r",
         "--rt-model",
         "--realtime_model_type",
-        type=str,  # no default='tiny',
-        help="Model size for real-time transcription. Options same as --model.  This is used only if real-time transcription is enabled (enable_realtime_transcription). Default is tiny.en.",
+        type=str,
+        help=(
+            "Realtime transcription model. Without --allow-download this must be "
+            "an existing local path. Default is the same value as --model."
+        ),
     )
 
     parser.add_argument(
         "-l",
         "--lang",
         "--language",
-        type=str,  # no default='en',
-        help="Language code for the STT model to transcribe in a specific language. Leave this empty for auto-detection based on input audio. Default is en. List of supported language codes: https://github.com/openai/whisper/blob/main/whisper/tokenizer.py#L11-L110",
+        type=str,
+        default="en",
+        help="Language code for transcription. Use an empty value for auto-detection. Default is en.",
     )
 
     parser.add_argument(
         "-d",
         "--root",
-        type=str,  # no default=None,
-        help="Root directory where the Whisper models are downloaded to.",
+        type=str,
+        help="Local models root. Default is the repository models directory.",
     )
 
     parser.add_argument(
@@ -49,18 +62,26 @@ if __name__ == "__main__":
         help="Device to use for computation. Options: cpu, cuda. Default is cpu.",
     )
 
-    from install_packages import check_and_install_packages
-
-    check_and_install_packages(
-        [
-            {
-                "import_name": "rich",
-            },
-            {
-                "import_name": "pyautogui",
-            },
-        ]
+    parser.add_argument(
+        "--allow-download",
+        action="store_true",
+        help="Allow RealtimeSTT/faster-whisper/torch.hub to download missing models.",
     )
+
+    parser.add_argument(
+        "--write-to-keyboard",
+        action="store_true",
+        help="Type final transcriptions into the currently focused window.",
+    )
+
+    parser.add_argument(
+        "--keyboard-interval",
+        type=float,
+        default=0.002,
+        help="Delay between typed characters when --write-to-keyboard is enabled.",
+    )
+
+    args = parser.parse_args()
 
     if EXTENDED_LOGGING:
         import logging
@@ -83,12 +104,41 @@ if __name__ == "__main__":
 
     import sys
 
-    args = parser.parse_args()
-    if args.root:
-        # Set TORCH_HOME to download the Silero VAD model into our specified models directory
-        torch_home = os.path.abspath(args.root)
-        os.environ["TORCH_HOME"] = torch_home
-        print(f"Environment variable TORCH_HOME set to: {torch_home}")
+    def looks_like_local_path(value):
+        return (
+            os.path.isabs(value)
+            or os.path.sep in value
+            or (os.path.altsep is not None and os.path.altsep in value)
+        )
+
+    def require_local_model(label, value):
+        if args.allow_download:
+            return
+        if not looks_like_local_path(value) or not os.path.isdir(value):
+            parser.error(
+                f"{label} must be an existing local model path when --allow-download "
+                f"is not set: {value}"
+            )
+
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    models_root = os.path.abspath(args.root or os.path.join(base_dir, "models"))
+    model_path = args.model or os.path.join(models_root, DEFAULT_MODEL_DIRNAME)
+    realtime_model_path = args.rt_model or model_path
+
+    os.environ["TORCH_HOME"] = models_root
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    if not args.allow_download:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    require_local_model("--model", model_path)
+    require_local_model("--rt-model", realtime_model_path)
+
+    print(f"Environment variable TORCH_HOME set to: {models_root}")
+    if args.allow_download:
+        print("Model downloads are allowed for this run.")
+    else:
+        print("Offline mode is enabled. Use --allow-download to permit model downloads.")
 
     from RealtimeSTT import AudioToTextRecorder
     import colorama
@@ -197,19 +247,19 @@ if __name__ == "__main__":
         prev_text = ""
         text_detected("")
 
-        if WRITE_TO_KEYBOARD_INTERVAL:
+        if args.write_to_keyboard:
             pyautogui.write(
-                f"{text} ", interval=WRITE_TO_KEYBOARD_INTERVAL
-            )  # Adjust interval as needed
+                f"{text} ", interval=args.keyboard_interval
+            )
 
     # Recorder configuration
     recorder_config = {
         "spinner": False,
-        "model": "large-v2",  # or large-v2 or deepdml/faster-whisper-large-v3-turbo-ct2 or ...
-        "download_root": None,  # default download root location. Ex. ~/.cache/huggingface/hub/ in Linux
+        "model": model_path,
+        "download_root": models_root,
         # 'input_device_index': 1,
-        "realtime_model_type": "tiny.en",  # or small.en or distil-small.en or ...
-        "language": "en",
+        "realtime_model_type": realtime_model_path,
+        "language": args.language or None,
         "silero_sensitivity": 0.05,
         "webrtc_sensitivity": 3,
         "post_speech_silence_duration": unknown_sentence_detection_pause,
@@ -236,26 +286,31 @@ if __name__ == "__main__":
         ),
         "silero_use_onnx": True,
         "faster_whisper_vad_filter": False,
-        "device": "cpu",
+        "device": args.device,
     }
 
     # args are parsed before this block
 
     # Automatically locate or facilitate download of the VAD model
-    if "TORCH_HOME" in os.environ:
-        expected_vad_path = os.path.join(
-            os.environ["TORCH_HOME"],
-            "hub",
-            "snakers4_silero-vad_master",
-            "silero_vad.onnx",
-        )
-        if os.path.exists(expected_vad_path):
-            recorder_config["silero_model_path"] = expected_vad_path
-            print(f"Found local Silero VAD model at: {expected_vad_path}")
-        else:
-            print(
-                f"Local Silero VAD model not found. If online, it will be downloaded to: {expected_vad_path}"
+    expected_vad_path = os.path.join(
+        models_root,
+        "hub",
+        "snakers4_silero-vad_master",
+        "silero_vad.onnx",
+    )
+    if os.path.exists(expected_vad_path):
+        recorder_config["silero_model_path"] = expected_vad_path
+        print(f"Found local Silero VAD model at: {expected_vad_path}")
+    elif not args.allow_download:
+        parser.error(
+            "Local Silero VAD model not found and --allow-download is not set: "
+            f"{expected_vad_path}"
             )
+    else:
+        print(
+            "Local Silero VAD model not found. RealtimeSTT may download it to: "
+            f"{expected_vad_path}"
+        )
 
     if EXTENDED_LOGGING:
         recorder_config["level"] = logging.DEBUG
