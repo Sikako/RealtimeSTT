@@ -4,8 +4,6 @@ import logging
 import queue
 import threading
 import time
-from typing import Optional
-
 import numpy as np
 from RealtimeSTT import AudioToTextRecorder
 
@@ -48,7 +46,7 @@ class VADProcessor(AudioToTextRecorder):
         model_path: str,
         models_dir: str,
         inference_queue: queue.Queue,
-        logger: Optional[logging.Logger] = None,
+        logger: logging.Logger | None = None,
         **kwargs,
     ):
         self.session_id = session_id
@@ -148,7 +146,14 @@ class VADProcessor(AudioToTextRecorder):
                 self.channel_id,
                 len(audio_data) / 16000,
             )
-            self.inference_queue.put(job)
+            try:
+                self.inference_queue.put(job, timeout=1)
+            except queue.Full:
+                self.logger.warning(
+                    "[%s][%s] Inference queue is full; dropping audio segment.",
+                    self.session_id,
+                    self.channel_id,
+                )
 
             self.allowed_to_early_transcribe = True
             self._set_state("inactive")
